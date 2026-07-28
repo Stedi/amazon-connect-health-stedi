@@ -160,7 +160,6 @@ amazon-connect-health-stedi-rte/
 
 ### Notes
 
-- **Concurrency:** Capped at `ReservedConcurrentExecutions: 10`. Adjust based on expected call volume.
 - **Timeout:** 30 seconds.
 - **VPC Placement:** Optional. When provided, Lambda is deployed into private subnets. A NAT Gateway is required for the Lambda to reach the Stedi API.
 - **Secrets Manager VPC Endpoint:** Created when `VpcId` is provided. Keeps credential retrieval traffic on the AWS private network.
