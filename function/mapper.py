@@ -22,6 +22,58 @@ def _from_stedi_date(stedi_date: str) -> str:
     """Converts YYYYMMDD to YYYY-MM-DD."""
     return f"{stedi_date[0:4]}-{stedi_date[4:6]}-{stedi_date[6:8]}"
 
+_PLAN_DATE_FIELDS = ("planBegin", "planEnd", "plan")
+
+# Benefit type codes 1-5 mean active coverage, 6-8 mean inactive coverage.
+# https://www.stedi.com/docs/healthcare/eligibility-active-coverage-benefits#active-and-inactive-coverage
+_ACTIVE_CODES = frozenset({"1", "2", "3", "4", "5"})
+_INACTIVE_CODES = frozenset({"6", "7", "8"})
+
+
+def _coverage_status(benefits: list) -> str:
+    """ACTIVE, INACTIVE, or UNKNOWN when the payer reported neither.
+
+    A payer that returns no benefits, or only a `V` (Cannot Process) stub
+    returns UNKNOWN.
+    """
+    codes = {benefit.get("code") for benefit in benefits}
+    if codes & _ACTIVE_CODES:
+        return "ACTIVE"
+    if codes & _INACTIVE_CODES:
+        return "INACTIVE"
+    return "UNKNOWN"
+
+
+def _plan_period(dates: dict) -> tuple[str | None, str | None]:
+    """(begin, end) from planDateInformation, in field priority order.
+
+    Returns YYYYMMDD strings, which compare correctly as strings.
+    """
+    begins: list[str] = []
+    ends: list[str] = []
+
+    for field in _PLAN_DATE_FIELDS:
+        value = dates.get(field)
+        if not value:
+            continue
+        begin, _, end = value.partition("-")
+        # A lone date is a beginning, except in planEnd, where it's an ending.
+        if field == "planEnd" and not end:
+            ends.append(begin)
+            continue
+        begins.append(begin)
+        if end:
+            ends.append(end)
+
+    begin = begins[0] if begins else None
+    end = ends[0] if ends else None
+
+    # Never report a period that ends before it starts.
+    if begin and end and end < begin:
+        end = None
+
+    return begin, end
+
 
 def map_request_to_vendor(request: RTEVerificationRequest) -> dict:
     """
@@ -54,6 +106,8 @@ def map_request_to_vendor(request: RTEVerificationRequest) -> dict:
         "subscriber": subscriber_dict,
         "encounter": {
             "serviceTypeCodes": ["30"],
+            "beginningDateOfService": _to_stedi_date(request.request_period_start),
+            "endDateOfService": _to_stedi_date(request.request_period_end),
         },
     }
 
@@ -72,29 +126,6 @@ def map_vendor_response(
         RTEVerificationResponse model.
     """
     benefits = vendor_response.get("benefitsInformation") or []
-    plan_info = vendor_response.get("planInformation") or {}
-
-    # status: ACTIVE if any benefitsInformation entry has code "1"
-    status = "INACTIVE"
-    for benefit in benefits:
-        if benefit.get("code") == "1":
-            status = "ACTIVE"
-            break
-
-    # eligibility period from planInformation
-    begin_date = plan_info.get("planBeginDate")
-    end_date = plan_info.get("planEndDate")
-
-    # fallback: scan benefitsInformation[].benefitsPeriod
-    if not begin_date or not end_date:
-        for benefit in benefits:
-            period = benefit.get("benefitsPeriod") or {}
-            if not begin_date:
-                begin_date = period.get("beginDate")
-            if not end_date:
-                end_date = period.get("endDate")
-            if begin_date and end_date:
-                break
 
     # expectedServiceCost: benefitAmount from first in-network Co-Payment for service type "33"
     # (Chiropractic). Could be made configurable via env var or Lambda input to support multiple STCs.
@@ -111,8 +142,10 @@ def map_vendor_response(
                 expected_service_cost = float(raw_amount)
                 break
 
+    begin_date, end_date = _plan_period(vendor_response.get("planDateInformation") or {})
+
     return RTEVerificationResponse(
-        status=status,
+        status=_coverage_status(benefits),
         eligibilityPeriodStart=(
             _from_stedi_date(begin_date)
             if begin_date
