@@ -1,0 +1,17 @@
+{
+  "coverageDetails": {
+    "identifier": { "id": "60054" },
+    "groupNumber": "GRP001",
+    "insuranceName": "Aetna",
+    "memberNumber": "AETNA12345",
+    "subscriber": {
+      "name": { "givenNames": ["Jane"], "lastName": "Doe" },
+      "dateOfBirth": "2004-04-04"
+    }
+  },
+  "patientIdentifier": { "id": "PAT001" },
+  "requestPeriodStart": "2025-01-01",
+  "requestPeriodEnd": "2025-12-31",
+  "providerNPI": { "id": "1999999984" },
+  "providerLastName": "Provider Name"
+}

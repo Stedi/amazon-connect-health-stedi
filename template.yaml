@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Real Time Eligibility (RTE) Insurance Verification Lambda
+
+Parameters:
+  StediApiKey:
+    Type: String
+    NoEcho: true
+    Description: Stedi API key (stored in Secrets Manager)
+  StediApiUrl:
+    Type: String
+    Default: https://healthcare.us.stedi.com/2024-04-01
+    Description: Stedi Real-Time Eligibility API base URL
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of private subnet IDs for Lambda VPC placement (leave blank to skip VPC)
+  VpcSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: Security group ID for the Lambda function (required if VpcSubnetIds is provided)
+  VpcId:
+    Type: String
+    Default: ''
+    Description: VPC ID for creating a Secrets Manager VPC Endpoint (required if VpcSubnetIds is provided)
+
+Conditions:
+  UseVpc: !Not [!Equals [!Select [0, !Ref VpcSubnetIds], '']]
+  UseVpcEndpoint: !And
+    - !Condition UseVpc
+    - !Not [!Equals [!Ref VpcId, '']]
+
+Resources:
+  VendorCredentialsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for encrypting RTE vendor credentials secret
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  VendorCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: connect/health/rte-vendor-credentials
+      KmsKeyId: !Ref VendorCredentialsKmsKey
+      SecretString: !Sub '{"api_key":"${StediApiKey}"}'
+
+  RTEDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref VendorCredentialsKmsKey
+      MessageRetentionPeriod: 1209600
+
+  RTEVerificationFunction: # checkov:skip=CKV_AWS_117:VPC placement is conditionally configured via VpcSubnetIds parameter
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC placement is conditionally configured via VpcSubnetIds parameter"
+          - id: W11
+            reason: "ec2:DescribeNetworkInterfaces does not support resource-level permissions; CreateNetworkInterface and DeleteNetworkInterface require * because Lambda manages ENIs dynamically"
+    Properties:
+      CodeUri: function/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 256
+      KmsKeyArn: !GetAtt VendorCredentialsKmsKey.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt RTEDeadLetterQueue.Arn
+      VpcConfig:
+        !If
+          - UseVpc
+          - SubnetIds: !Ref VpcSubnetIds
+            SecurityGroupIds:
+              - !Ref VpcSecurityGroupId
+          - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          RTE_VENDOR_API_URL: !Ref StediApiUrl
+          RTE_VENDOR_ELIGIBILITY_PATH: /change/medicalnetwork/eligibility/v3
+          RTE_VENDOR_CREDENTIALS_SECRET_ARN: !Ref VendorCredentials
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref VendorCredentials
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt VendorCredentialsKmsKey.Arn
+        - !If
+          - UseVpc
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+          - !Ref AWS::NoValue
+
+  RTEVerificationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RTEVerificationFunction
+      Action: lambda:InvokeFunction
+      Principal: health-agent.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:health-agent:${AWS::Region}:${AWS::AccountId}:*
+
+  SecretsManagerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseVpcEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref VpcSubnetIds
+      SecurityGroupIds:
+        - !Ref VpcSecurityGroupId
+
+Outputs:
+  RTEVerificationFunctionArn:
+    Description: ARN of the RTE Verification Lambda function
+    Value: !GetAtt RTEVerificationFunction.Arn
