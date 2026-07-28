@@ -86,7 +86,7 @@ Expected response:
 ```json
 {
   "statusCode": 200,
-  "body": "{\"status\":\"ACTIVE\",\"eligibilityPeriodStart\":\"2025-01-01\",\"eligibilityPeriodEnd\":\"2025-12-31\",\"paymentInformation\":{\"expectedServiceCost\":25.0}}"
+  "body": "{\"status\":\"ACTIVE\",\"eligibilityPeriodStart\":\"2024-04-01\",\"eligibilityPeriodEnd\":\"2025-12-31\",\"paymentInformation\":{\"expectedServiceCost\":25.0}}"
 }
 {
   "StatusCode": 200,
@@ -160,7 +160,6 @@ amazon-connect-health-stedi-rte/
 
 ### Notes
 
-- **Concurrency:** Capped at `ReservedConcurrentExecutions: 10`. Adjust based on expected call volume.
 - **Timeout:** 30 seconds.
 - **VPC Placement:** Optional. When provided, Lambda is deployed into private subnets. A NAT Gateway is required for the Lambda to reach the Stedi API.
 - **Secrets Manager VPC Endpoint:** Created when `VpcId` is provided. Keeps credential retrieval traffic on the AWS private network.
@@ -214,13 +213,17 @@ Amazon Connect Health sends the following JSON payload to this Lambda:
     }
   },
   "patientIdentifier": { "id": "string" },
-  "requestPeriodStart": "YYYY-MM-DD",
-  "requestPeriodEnd": "YYYY-MM-DD",
+  "requestPeriodStart": "YYYY-MM-DD (service date start)",
+  "requestPeriodEnd": "YYYY-MM-DD (service date end)",
   "providerNPI": { "id": "string (10-digit NPI)" },
   "providerLastName": "string (optional, mapped to provider organizationName)",
   "departmentNPI": { "id": "string (optional, accepted but unused)" }
 }
 ```
+
+`requestPeriodStart` and `requestPeriodEnd` are the dates of the appointment being booked. They are sent to Stedi as `encounter.beginningDateOfService` and `encounter.endDateOfService`, so the payer answers for the appointment rather than for today.
+
+That matters for the response too: `eligibilityPeriodStart` and `eligibilityPeriodEnd` fall back to these dates when the payer reports none of its own. The fallback is only meaningful because the payer confirmed coverage for exactly this period, so the two mappings have to change together.
 
 ## Response Schema
 
@@ -235,8 +238,12 @@ On success (HTTP 200):
 
 | Field | Description |
 |---|---|
-| `status` | `ACTIVE` if any `benefitsInformation` entry has `code: "1"`, otherwise `INACTIVE` |
-| `eligibilityPeriodStart` | From `planInformation.planBeginDate`, falling back to `benefitsPeriod` dates, then `requestPeriodStart` |
-| `eligibilityPeriodEnd` | From `planInformation.planEndDate`, falling back to `benefitsPeriod` dates, then `requestPeriodEnd` |
+| `status` | `ACTIVE` if any `benefitsInformation` entry has a [`code`](https://www.stedi.com/docs/healthcare/eligibility-active-coverage-benefits#active-and-inactive-coverage) of `1`-`5`, `INACTIVE` if one has `6`-`8`, otherwise `UNKNOWN` |
+| `eligibilityPeriodStart` | `planDateInformation.planBegin`, falling back to `plan`, then to `requestPeriodStart` |
+| `eligibilityPeriodEnd` | `planDateInformation.planEnd`, falling back to `plan`, then to `requestPeriodEnd` |
 | `paymentInformation.expectedServiceCost` | `benefitAmount` from the first in-network co-payment (`code: "B"`) for service type code `33`. `null` if no match |
 
+> [!NOTE]
+> The coverage date logic is simplified for demonstration purposes. See Stedi's full guidance on [when a patient is eligible for benefits](https://www.stedi.com/docs/healthcare/eligibility-active-coverage-benefits#when-is-the-patient-eligible-for-benefits).
+
+Each of the date fields holds either a single `YYYYMMDD` date or a `YYYYMMDD-YYYYMMDD` range, so `planBegin` and `plan` can each supply both ends of the period on their own. A lone date is read as a start, except in `planEnd`. If the payer reports no usable date – or an end that falls before the start – the field falls back to the requested service dates, matching the [AWS sample's response schema](https://github.com/aws-samples/sample-healthcare-realtime-eligibility#response-schema).
