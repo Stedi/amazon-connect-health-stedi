@@ -9,7 +9,7 @@ Parameters:
     Description: Stedi API key (stored in Secrets Manager)
   StediApiUrl:
     Type: String
-    Default: https://healthcare.us.stedi.com/2024-04-01
+    Default: https://healthcare.us.stedi.com/2026-06-01
     Description: Stedi Real-Time Eligibility API base URL
   VpcSubnetIds:
     Type: CommaDelimitedList
@@ -88,7 +88,7 @@ Resources:
       Environment:
         Variables:
           RTE_VENDOR_API_URL: !Ref StediApiUrl
-          RTE_VENDOR_ELIGIBILITY_PATH: /change/medicalnetwork/eligibility/v3
+          RTE_VENDOR_ELIGIBILITY_PATH: /eligibility-check
           RTE_VENDOR_CREDENTIALS_SECRET_ARN: !Ref VendorCredentials
       Policies:
         - Statement:
