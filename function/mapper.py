@@ -1,5 +1,5 @@
 """
-Field mapping between Amazon Connect Health and Stedi's Real-Time Eligibility API.
+Field mapping between Amazon Connect Health and Stedi's Real-Time Eligibility Check JSON API.
 
 Handles:
 - Amazon Connect Health request → Stedi request transformation
@@ -13,66 +13,38 @@ from models import (
 )
 
 
-def _to_stedi_date(iso_date: str) -> str:
-    """Converts YYYY-MM-DD to YYYYMMDD."""
-    return iso_date.replace("-", "")
-
-
-def _from_stedi_date(stedi_date: str) -> str:
-    """Converts YYYYMMDD to YYYY-MM-DD."""
-    return f"{stedi_date[0:4]}-{stedi_date[4:6]}-{stedi_date[6:8]}"
-
-_PLAN_DATE_FIELDS = ("planBegin", "planEnd", "plan")
-
-# Benefit type codes 1-5 mean active coverage, 6-8 mean inactive coverage.
-# https://www.stedi.com/docs/healthcare/eligibility-active-coverage-benefits#active-and-inactive-coverage
-_ACTIVE_CODES = frozenset({"1", "2", "3", "4", "5"})
-_INACTIVE_CODES = frozenset({"6", "7", "8"})
-
-
-def _coverage_status(benefits: list) -> str:
+def _coverage_status(statuses: list) -> str:
     """ACTIVE, INACTIVE, or UNKNOWN when the payer reported neither.
 
-    A payer that returns no benefits, or only a `V` (Cannot Process) stub
-    returns UNKNOWN.
+    A payer that returns no coverage statuses returns UNKNOWN.
+    https://www.stedi.com/docs/healthcare/eligibility-active-coverage-benefits#active-and-inactive-coverage
     """
-    codes = {benefit.get("code") for benefit in benefits}
-    if codes & _ACTIVE_CODES:
+    values = {entry.get("status") or "" for entry in statuses}
+    if any(value.startswith("ACTIVE") for value in values):
         return "ACTIVE"
-    if codes & _INACTIVE_CODES:
+    if any(value.startswith("INACTIVE") for value in values):
         return "INACTIVE"
     return "UNKNOWN"
 
 
-def _plan_period(dates: dict) -> tuple[str | None, str | None]:
-    """(begin, end) from planDateInformation, in field priority order.
+def _benefits(vendor_response: dict, benefit_type: str) -> list:
+    return [
+        entry
+        for plan in vendor_response.get("plans") or []
+        for entry in (plan.get("benefits") or {}).get(benefit_type) or []
+    ]
 
-    Returns YYYYMMDD strings, which compare correctly as strings.
-    """
-    begins: list[str] = []
-    ends: list[str] = []
 
-    for field in _PLAN_DATE_FIELDS:
-        value = dates.get(field)
-        if not value:
-            continue
-        begin, _, end = value.partition("-")
-        # A lone date is a beginning, except in planEnd, where it's an ending.
-        if field == "planEnd" and not end:
-            ends.append(begin)
-            continue
-        begins.append(begin)
-        if end:
-            ends.append(end)
-
-    begin = begins[0] if begins else None
-    end = ends[0] if ends else None
+def _plan_period(vendor_response: dict) -> tuple[str | None, str | None]:
+    """(start, end) of the subscriber's plan dates, as YYYY-MM-DD strings."""
+    plan = ((vendor_response.get("subscriber") or {}).get("dates") or {}).get("plan") or {}
+    start, end = plan.get("start"), plan.get("end")
 
     # Never report a period that ends before it starts.
-    if begin and end and end < begin:
+    if start and end and end < start:
         end = None
 
-    return begin, end
+    return start, end
 
 
 def map_request_to_vendor(request: RTEVerificationRequest) -> dict:
@@ -89,26 +61,29 @@ def map_request_to_vendor(request: RTEVerificationRequest) -> dict:
     subscriber_name = subscriber.name if subscriber else None
 
     subscriber_dict: dict = {"memberId": request.coverage_details.member_number}
-    if subscriber_name and subscriber_name.given_names:
-        subscriber_dict["firstName"] = subscriber_name.given_names[0]
-    if subscriber_name and subscriber_name.last_name:
-        subscriber_dict["lastName"] = subscriber_name.last_name
     if subscriber and subscriber.date_of_birth:
-        subscriber_dict["dateOfBirth"] = _to_stedi_date(subscriber.date_of_birth)
-
-    provider_dict: dict = {"npi": request.provider_npi.id}
-    if request.provider_last_name:
-        provider_dict["organizationName"] = request.provider_last_name
+        subscriber_dict["dateOfBirth"] = subscriber.date_of_birth
+    person: dict = {}
+    if subscriber_name and subscriber_name.given_names:
+        person["firstName"] = subscriber_name.given_names[0]
+    if subscriber_name and subscriber_name.last_name:
+        person["lastName"] = subscriber_name.last_name
+    if person:
+        subscriber_dict["name"] = {"person": person}
 
     return {
-        "tradingPartnerServiceId": request.coverage_details.identifier.id,
-        "provider": provider_dict,
-        "subscriber": subscriber_dict,
         "encounter": {
-            "serviceTypeCodes": ["30"],
-            "beginningDateOfService": _to_stedi_date(request.request_period_start),
-            "endDateOfService": _to_stedi_date(request.request_period_end),
+            "dates": {
+                "service": {
+                    "end": request.request_period_end,
+                    "start": request.request_period_start,
+                }
+            },
+            "services": [{"system": "STC", "value": "30"}],
         },
+        "payerId": request.coverage_details.identifier.id,
+        "provider": {"npi": request.provider_npi.id},
+        "subscriber": subscriber_dict,
     }
 
 
@@ -125,36 +100,27 @@ def map_vendor_response(
     Returns:
         RTEVerificationResponse model.
     """
-    benefits = vendor_response.get("benefitsInformation") or []
-
-    # expectedServiceCost: benefitAmount from first in-network Co-Payment for service type "33"
+    # expectedServiceCost: amount from first in-network co-payment for service type "33"
     # (Chiropractic). Could be made configurable via env var or Lambda input to support multiple STCs.
     COPAY_SERVICE_TYPE_CODE = "33"
     expected_service_cost = None
-    for benefit in benefits:
+    for copay in _benefits(vendor_response, "coPayment"):
+        service = copay.get("service") or {}
         if (
-            benefit.get("code") == "B"
-            and benefit.get("inPlanNetworkIndicatorCode") == "Y"
-            and COPAY_SERVICE_TYPE_CODE in (benefit.get("serviceTypeCodes") or [])
+            (copay.get("network") or {}).get("indicator") == "IN_NETWORK"
+            and service.get("system") == "STC"
+            and service.get("value") == COPAY_SERVICE_TYPE_CODE
         ):
-            raw_amount = benefit.get("benefitAmount")
+            raw_amount = copay.get("amount")
             if raw_amount is not None:
                 expected_service_cost = float(raw_amount)
                 break
 
-    begin_date, end_date = _plan_period(vendor_response.get("planDateInformation") or {})
+    start_date, end_date = _plan_period(vendor_response)
 
     return RTEVerificationResponse(
-        status=_coverage_status(benefits),
-        eligibilityPeriodStart=(
-            _from_stedi_date(begin_date)
-            if begin_date
-            else original_request.request_period_start
-        ),
-        eligibilityPeriodEnd=(
-            _from_stedi_date(end_date)
-            if end_date
-            else original_request.request_period_end
-        ),
+        status=_coverage_status(_benefits(vendor_response, "statuses")),
+        eligibilityPeriodStart=start_date or original_request.request_period_start,
+        eligibilityPeriodEnd=end_date or original_request.request_period_end,
         paymentInformation=PaymentInformation(expectedServiceCost=expected_service_cost),
     )
